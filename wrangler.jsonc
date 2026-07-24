@@ -1,0 +1,48 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "8004-audit-robot",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-07-01",
+	"compatibility_flags": [
+		"nodejs_compat",
+    "global_fetch_strictly_public"
+	],
+	"observability": {
+		"enabled": true
+	},
+	"vars": {
+		"SCAN_BASE_URL": "https://8004scan.io/api/v1/public/agents",
+		"SCAN_PAGE_LIMIT": "20",
+		"AUDITOR_BASE_URL": "https://auditor-agent.infrasika.workers.dev",
+		"AUDIT_INTERVAL_MS": "300000"
+	},
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "SCHEDULER",
+				"class_name": "AuditScheduler"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"AuditScheduler"
+			]
+		}
+	],
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "audit_robot",
+			"database_id": "3f4a589b-053e-4a21-96fd-0f344c836459",
+			"remote": true
+		}
+	],
+	"triggers": {
+		"crons": [
+			"*/5 * * * *"
+		]
+	}
+}

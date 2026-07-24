@@ -1,0 +1,22 @@
+{
+  "name": "8004-audit-robot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Robot for auto-auditing agents listed on 8004scan.io",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "cf-typegen": "wrangler types",
+    "db:migrate:new": "wrangler d1 migrations create audit_robot",
+    "db:migrate:list": "wrangler d1 migrations list audit_robot --local",
+    "db:migrate:local": "wrangler d1 migrations apply audit_robot --local",
+    "db:migrate:remote": "wrangler d1 migrations apply audit_robot --remote"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260722.1",
+    "typescript": "^5.6.0",
+    "wrangler": "^4.114.0"
+  }
+}
