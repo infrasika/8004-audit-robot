@@ -14,7 +14,9 @@
 		"SCAN_BASE_URL": "https://8004scan.io/api/v1/public/agents",
 		"SCAN_PAGE_LIMIT": "20",
 		"AUDITOR_BASE_URL": "https://auditor-agent.infrasika.workers.dev",
-		"AUDIT_INTERVAL_MS": "300000"
+		"AUDIT_INTERVAL_MS": "60000",
+		"AUDIT_POLL_INTERVAL_MS": "10000",
+		"AUDIT_POLL_TIMEOUT_MS": "1860000"
 	},
 	"durable_objects": {
 		"bindings": [

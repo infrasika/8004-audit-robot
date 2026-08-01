@@ -3,8 +3,10 @@
 Robot that auto-audits agents listed on [8004scan.io](https://8004scan.io).
 
 It pulls agents from the 8004scan public API page by page, and audits them one at a
-time via the auditor service. Non-cached audits are paced at 5 minutes apart; when
-the auditor returns `cached: true` it immediately moves on to the next agent. Every
+time via the auditor service. After an audit is accepted, the robot polls its report
+until the auditor reports `completed` or `failed`; only then does it record the
+result and move to the next agent. Non-cached audits are paced at the configured
+interval; cached audits move on immediately after completion is confirmed. Every
 attempt (success or failure) is recorded to D1. A round makes a single pass over all
 agents and then stops.
 
@@ -70,6 +72,8 @@ Configuration lives in `wrangler.jsonc` under `vars`:
 | `SCAN_PAGE_LIMIT` | agents fetched per page | `20` |
 | `AUDITOR_BASE_URL` | auditor service base URL | `https://auditor-agent.infrasika.workers.dev` |
 | `AUDIT_INTERVAL_MS` | delay between non-cached audits | `300000` (5 min) |
+| `AUDIT_POLL_INTERVAL_MS` | delay between report-status polls | `10000` (10 sec) |
+| `AUDIT_POLL_TIMEOUT_MS` | maximum time to wait for a terminal report status | `1860000` (31 min) |
 
 ## Run
 
