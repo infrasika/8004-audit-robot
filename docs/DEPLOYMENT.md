@@ -6,9 +6,10 @@
 
 - 从 8004scan 分页读取 agent；
 - 通过 Durable Object alarm 逐个提交审计；
-- 将每次提交结果写入 D1；
+- 只将 `/oasf/audit` 的网络、超时、非 2xx 和协议失败写入 D1；结构化
+  `AGENT_CARD_NOT_FOUND` 是跨 HTTP 状态的业务结果例外；
 - 每 5 分钟执行一次 Cron，恢复意外丢失的 alarm；
-- 提供 `/start`、`/stop`、`/status` 和 `/records` 管理接口。
+- 提供 `/start`、`/stop`、`/status` 和 `/audit-failures` 管理接口。
 
 > Cron 不会自动启动新的审计轮次。首次启动以及每轮结束后的再次启动，都需要调用
 > `POST /start`。
@@ -95,7 +96,11 @@ npm run db:migrate:remote
 npx wrangler d1 migrations list audit_robot --remote
 ```
 
-当前迁移会创建 `audit_records` 表及其索引。
+`0002_replace_audit_records.sql` 会创建 `oasf_audit_fails` 并直接删除
+`audit_records`。这是不可逆的数据删除，不保留旧审计流水。
+
+`0003_remove_agent_card_not_found_fails.sql` 会删除旧版本误写入的
+`AGENT_CARD_NOT_FOUND` 失败行。
 
 ## 3. 配置审计服务调用
 
@@ -163,14 +168,16 @@ Cloudflare 区域时，应在 `wrangler.jsonc` 中启用公开路由兼容标志
 
 ## 4. 检查生产参数
 
-默认变量位于 `wrangler.jsonc`：
+运行参数位于 `wrangler.jsonc`，以下只展示结构；部署值以实际配置文件为准：
 
 ```jsonc
 "vars": {
   "SCAN_BASE_URL": "https://8004scan.io/api/v1/public/agents",
-  "SCAN_PAGE_LIMIT": "20",
+  "SCAN_PAGE_LIMIT": "<每页数量>",
   "AUDITOR_BASE_URL": "https://auditor-agent.infrasika.workers.dev",
-  "AUDIT_INTERVAL_MS": "300000"
+  "AUDIT_INTERVAL_MS": "<审计间隔毫秒>",
+  "AUDIT_POLL_INTERVAL_MS": "<轮询间隔毫秒>",
+  "AUDIT_POLL_TIMEOUT_MS": "<轮询总超时毫秒>"
 }
 ```
 
@@ -181,18 +188,22 @@ Cloudflare 区域时，应在 `wrangler.jsonc` 中启用公开路由兼容标志
 | `SCAN_BASE_URL` | 8004scan agent 列表接口 |
 | `SCAN_PAGE_LIMIT` | 每页读取数量 |
 | `AUDITOR_BASE_URL` | 公开 URL 调用模式下的 auditor 地址 |
-| `AUDIT_INTERVAL_MS` | 非缓存审计之间的等待时间，默认 5 分钟 |
+| `AUDIT_INTERVAL_MS` | 非缓存审计及 HTTP 2xx 业务结果后的等待时间 |
+| `AUDIT_POLL_INTERVAL_MS` | 报告轮询间隔 |
+| `AUDIT_POLL_TIMEOUT_MS` | 报告轮询总超时 |
 
-`AUDIT_INTERVAL_MS` 只影响非缓存结果。auditor 返回 `cached: true` 时会立即处理下一条。
+`AUDIT_INTERVAL_MS` 用于非缓存审计结束后以及 HTTP 2xx 业务错误后的等待。
+auditor 返回 `cached: true` 且报告已确认时会立即处理下一条。
 
 8004scan 的 agent 数量较多，一轮完整扫描可能运行很久。首次生产验证建议启动后观察
-少量记录，再通过 `/stop` 停止，不要为了测试直接把审计间隔调得非常小。
+少量 agent 的日志和 `/status`，再通过 `/stop` 停止，不要为了测试直接把审计间隔调得非常小。
 
 ## 5. 部署前验证
 
 执行类型检查：
 
 ```bash
+npm test
 npm run typecheck
 ```
 
@@ -266,10 +277,10 @@ curl -X POST "$ROBOT_URL/start"
 curl "$ROBOT_URL/status"
 ```
 
-查询最近记录：
+查询当前未解决的提交失败：
 
 ```bash
-curl "$ROBOT_URL/records?limit=20"
+curl "$ROBOT_URL/audit-failures?limit=20"
 ```
 
 正常日志应依次出现：
@@ -279,15 +290,16 @@ curl "$ROBOT_URL/records?limit=20"
 [scan] response
 [round] auditing agent
 [audit] request
-[audit] result
+[audit] accepted | business result | submission failed
 ```
 
-成功记录应满足：
+验证规则：
 
-- `success` 为 `1`；
-- `report_id` 不为空；
-- `error` 为空；
-- 命中 auditor 缓存时 `cached` 为 `1`。
+- 返回合法 `auditId` 的提交不写 D1，并进入报告轮询；
+- HTTP 2xx 的结构化业务错误不写 D1，也不进入报告轮询；
+- 结构化 `AGENT_CARD_NOT_FOUND` 即使使用 HTTP 500 返回，也不写 D1；
+- 网络、超时、其他非 2xx 或无效 2xx 响应会按 agent 联合主键写入失败表；
+- 同一 agent 后续正常提交或返回上述业务结果时，旧失败行会被删除。
 
 完成少量生产验证后，可停止当前轮次：
 
@@ -295,7 +307,7 @@ curl "$ROBOT_URL/records?limit=20"
 curl -X POST "$ROBOT_URL/stop"
 ```
 
-停止不会删除已经写入 D1 的审计记录。
+停止不会清空 `oasf_audit_fails` 中尚未解决的提交失败。
 
 ## 8. Cron 和 Durable Object
 
@@ -326,7 +338,7 @@ Cron 每 5 分钟检查一次单例 Durable Object：
 - `POST /start`
 - `POST /stop`
 - `GET /status`
-- `GET /records`
+- `GET /audit-failures`
 
 直接部署到 `workers.dev` 后，知道地址的任何人都可以调用这些接口。
 
@@ -336,7 +348,7 @@ Cron 每 5 分钟检查一次单例 Durable Object：
 - 绑定自定义域名，并使用 Cloudflare Access 保护管理接口；
 - 禁用公开 `workers.dev` 地址，只允许受控入口访问。
 
-完成鉴权前，不建议公开传播 Worker URL。`/records` 中还可能包含 agent owner 地址和
+完成鉴权前，不建议公开传播 Worker URL。`/audit-failures` 中还可能包含 agent owner 地址和
 审计错误信息。
 
 ## 10. 常见问题
@@ -368,7 +380,7 @@ error: "The operation was aborted due to timeout"
 确认 `wrangler.jsonc` 中已经使用 `npx wrangler d1 create audit_robot` 返回的真实 ID，
 而不是 `REPLACE_WITH_D1_DATABASE_ID`。
 
-### 查询记录时提示表不存在
+### 查询失败记录时提示表不存在
 
 生产迁移尚未执行：
 
@@ -420,14 +432,15 @@ npx wrangler deploy --dry-run
 npm run deploy
 ```
 
-如果包含新的 D1 migration，应先确认迁移是否向后兼容，再执行：
+本次 `0002_replace_audit_records.sql` 会直接删除旧表。发布前先停止活动轮次，然后执行：
 
 ```bash
 npm run db:migrate:remote
+npm run deploy
 ```
 
-应用代码版本可以在 Cloudflare Workers 控制台中回滚。D1 migration 不会随 Worker
-版本回滚，因此生产数据库变更必须单独设计回退方案。
+不要再回滚到依赖 `audit_records` 的旧 Worker。D1 migration 不会随 Worker 版本回滚；
+如必须恢复旧版本，需要先通过新的 migration 重建旧表。
 
 ## 12. 官方参考
 

@@ -1,11 +1,29 @@
 import type { Env, ScanAgent, ScanPage } from "./types";
 
+const UINT256_MAX = (1n << 256n) - 1n;
+
+/** Normalize API identifiers to canonical decimal strings without precision loss. */
+function normalizeUint256Decimal(value: unknown): string {
+  const decimal = typeof value === "string"
+    ? value.trim()
+    : typeof value === "number" && Number.isSafeInteger(value)
+      ? String(value)
+      : typeof value === "bigint"
+        ? value.toString()
+        : "";
+  if (!/^\d+$/.test(decimal) || BigInt(decimal) > UINT256_MAX) {
+    throw new Error("identifier must be an unsigned uint256 decimal integer");
+  }
+  return BigInt(decimal).toString();
+}
+
 interface ScanApiResponse {
   success: boolean;
   data: Array<{
     name: string | null;
-    chain_id: number;
-    token_id: string;
+    description?: string | null;
+    chain_id: string | number;
+    token_id: string | number;
     chain_type: string | null;
     owner_address: string | null;
   }>;
@@ -43,8 +61,9 @@ export async function fetchAgentsPage(env: Env, page: number): Promise<ScanPage>
   const body = (await resp.json()) as ScanApiResponse;
   const agents: ScanAgent[] = (body.data ?? []).map((a) => ({
     name: a.name ?? null,
-    chain_id: a.chain_id,
-    token_id: a.token_id,
+    description: a.description ?? null,
+    chain_id: normalizeUint256Decimal(a.chain_id),
+    token_id: normalizeUint256Decimal(a.token_id),
     chain_type: a.chain_type ?? null,
     owner_address: a.owner_address ?? null,
   }));

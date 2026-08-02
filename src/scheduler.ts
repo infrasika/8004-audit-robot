@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
-import type { AuditOutcome, Env, ScanAgent } from "./types";
+import type { AuditOutcome, AuditSubmission, Env, ScanAgent } from "./types";
 import { fetchAgentsPage } from "./scan";
 import { pollAudit, startAudit } from "./auditor";
-import { recordAudit } from "./db";
+import { deleteAuditFail, upsertAuditFail } from "./db";
 
 const STATE_KEY = "state";
 /** Small delay used to chain immediately when a result is cached. */
@@ -15,6 +15,7 @@ interface RoundStats {
   audited: number;
   succeeded: number;
   failed: number;
+  skipped: number;
   cached: number;
   pages: number;
 }
@@ -31,6 +32,7 @@ interface RoundState {
   finishedAt: string | null;
   lastError: string | null;
   pendingAudit: PendingAudit | null;
+  pendingBusinessResult: PendingBusinessResult | null;
   /** Prevent the cron safety net from mistaking a running alarm for a lost one. */
   alarmLeaseUntil: string | null;
 }
@@ -41,6 +43,15 @@ interface PendingAudit {
   submittedAt: string;
   lastStatus: string | null;
   pollAttempts: number;
+  /** Delete a stale submission-failure row before polling the accepted audit. */
+  failureCleanupPending: boolean;
+}
+
+interface PendingBusinessResult {
+  code: string;
+  message: string | null;
+  retryable: boolean | null;
+  observedAt: string;
 }
 
 function freshState(): RoundState {
@@ -51,11 +62,12 @@ function freshState(): RoundState {
     batch: [],
     index: 0,
     hasMore: true,
-    stats: { audited: 0, succeeded: 0, failed: 0, cached: 0, pages: 0 },
+    stats: { audited: 0, succeeded: 0, failed: 0, skipped: 0, cached: 0, pages: 0 },
     startedAt: null,
     finishedAt: null,
     lastError: null,
     pendingAudit: null,
+    pendingBusinessResult: null,
     alarmLeaseUntil: null,
   };
 }
@@ -70,11 +82,19 @@ export class AuditScheduler extends DurableObject<Env> {
     const stored = await this.ctx.storage.get<Partial<RoundState>>(STATE_KEY);
     if (!stored) return freshState();
     const fresh = freshState();
+    const pendingAudit = stored.pendingAudit
+      ? {
+          ...stored.pendingAudit,
+          // A pending audit written by the pre-refactor worker has no failure row to clear.
+          failureCleanupPending: stored.pendingAudit.failureCleanupPending ?? false,
+        }
+      : null;
     return {
       ...fresh,
       ...stored,
       stats: { ...fresh.stats, ...stored.stats },
-      pendingAudit: stored.pendingAudit ?? null,
+      pendingAudit,
+      pendingBusinessResult: stored.pendingBusinessResult ?? null,
       alarmLeaseUntil: stored.alarmLeaseUntil ?? null,
     };
   }
@@ -146,6 +166,7 @@ export class AuditScheduler extends DurableObject<Env> {
     state.active = false;
     state.finishedAt = new Date().toISOString();
     state.pendingAudit = null;
+    state.pendingBusinessResult = null;
     state.alarmLeaseUntil = null;
     await this.save(state);
     await this.ctx.storage.deleteAlarm();
@@ -164,6 +185,10 @@ export class AuditScheduler extends DurableObject<Env> {
     return positiveMs(this.env.AUDIT_POLL_TIMEOUT_MS, DEFAULT_POLL_TIMEOUT_MS);
   }
 
+  private auditIntervalMs(): number {
+    return positiveMs(this.env.AUDIT_INTERVAL_MS, 300_000);
+  }
+
   private async schedule(state: RoundState, delayMs: number): Promise<void> {
     // Persist progress before making the next alarm visible.
     await this.save(state);
@@ -172,15 +197,42 @@ export class AuditScheduler extends DurableObject<Env> {
     await this.save(state);
   }
 
-  private async finishAgent(
+  private async advanceAgent(
+    state: RoundState,
+    outcome: AuditOutcome,
+    skipped = false,
+  ): Promise<void> {
+    // An operator may have stopped this round while an external request was in flight.
+    if (!(await this.isCurrentRound(state))) return;
+
+    state.pendingAudit = null;
+    state.pendingBusinessResult = null;
+    state.index += 1;
+    state.stats.audited += 1;
+    if (skipped) state.stats.skipped += 1;
+    else if (outcome.success) state.stats.succeeded += 1;
+    else state.stats.failed += 1;
+    if (outcome.cached === true) state.stats.cached += 1;
+    state.lastError = null;
+
+    const delay = outcome.cached === true ? IMMEDIATE_DELAY_MS : this.auditIntervalMs();
+    await this.schedule(state, delay);
+  }
+
+  private async persistSubmissionFailure(
     state: RoundState,
     agent: ScanAgent,
-    outcome: AuditOutcome,
-    auditedAt: string,
+    submission: Extract<AuditSubmission, { kind: "failure" }>,
+    failedAt: string,
   ): Promise<void> {
-    // Persist the record BEFORE advancing the cursor so no agent is ever skipped.
     try {
-      await recordAudit(this.env, agent, outcome, auditedAt);
+      await upsertAuditFail(
+        this.env,
+        agent,
+        submission.targetUrl,
+        submission.failure,
+        failedAt,
+      );
     } catch (err) {
       if (!(await this.isCurrentRound(state))) return;
       state.lastError = `DB write failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -188,23 +240,52 @@ export class AuditScheduler extends DurableObject<Env> {
       throw err;
     }
 
-    // An operator may have stopped this round while the D1 request was in flight.
-    if (!(await this.isCurrentRound(state))) return;
+    await this.advanceAgent(state, { success: false, cached: null });
+  }
 
-    state.pendingAudit = null;
-    state.index += 1;
-    state.stats.audited += 1;
-    if (outcome.success) state.stats.succeeded += 1;
-    else state.stats.failed += 1;
-    if (outcome.cached === true) state.stats.cached += 1;
+  private async clearAcceptedFailure(
+    state: RoundState,
+    agent: ScanAgent,
+  ): Promise<boolean> {
+    const pending = state.pendingAudit!;
+    if (!pending.failureCleanupPending) return true;
+    try {
+      await deleteAuditFail(this.env, agent);
+    } catch (err) {
+      if (!(await this.isCurrentRound(state))) return false;
+      state.lastError = `DB cleanup failed: ${err instanceof Error ? err.message : String(err)}`;
+      await this.schedule(state, this.pollIntervalMs());
+      return false;
+    }
+    if (!(await this.isCurrentRound(state))) return false;
+    pending.failureCleanupPending = false;
     state.lastError = null;
+    await this.save(state);
+    return true;
+  }
 
-    const intervalMs = positiveMs(this.env.AUDIT_INTERVAL_MS, 300_000);
-    const delay = outcome.cached === true ? IMMEDIATE_DELAY_MS : intervalMs;
-    await this.schedule(state, delay);
+  private async finishBusinessResult(state: RoundState, agent: ScanAgent): Promise<void> {
+    const pending = state.pendingBusinessResult!;
+    try {
+      await deleteAuditFail(this.env, agent);
+    } catch (err) {
+      if (!(await this.isCurrentRound(state))) return;
+      state.lastError = `DB cleanup failed: ${err instanceof Error ? err.message : String(err)}`;
+      await this.schedule(state, this.pollIntervalMs());
+      return;
+    }
+    if (!(await this.isCurrentRound(state))) return;
+    console.log("[audit] business result finalized", {
+      name: agent.name,
+      code: pending.code,
+      message: pending.message,
+      retryable: pending.retryable,
+    });
+    await this.advanceAgent(state, { success: false, cached: null }, true);
   }
 
   private async pollPendingAudit(state: RoundState, agent: ScanAgent): Promise<void> {
+    if (!(await this.clearAcceptedFailure(state, agent))) return;
     const pending = state.pendingAudit!;
     const result = await pollAudit(this.env, pending.auditId);
     // Do not let an old alarm overwrite a stopped or newly-started round.
@@ -213,17 +294,10 @@ export class AuditScheduler extends DurableObject<Env> {
     if (result.status !== null) pending.lastStatus = result.status;
 
     if (result.terminal) {
-      await this.finishAgent(
-        state,
-        agent,
-        {
-          reportId: pending.auditId,
-          cached: pending.cached,
-          success: result.success,
-          error: result.error,
-        },
-        pending.submittedAt,
-      );
+      await this.advanceAgent(state, {
+        cached: pending.cached,
+        success: result.success,
+      });
       return;
     }
 
@@ -231,17 +305,12 @@ export class AuditScheduler extends DurableObject<Env> {
     const elapsedMs = Number.isFinite(submittedAtMs) ? Date.now() - submittedAtMs : 0;
     if (elapsedMs >= this.pollTimeoutMs()) {
       const lastDetail = result.error ?? `last status: ${pending.lastStatus ?? "unknown"}`;
-      await this.finishAgent(
-        state,
-        agent,
-        {
-          reportId: pending.auditId,
-          cached: pending.cached,
-          success: false,
-          error: `Audit polling timed out after ${elapsedMs} ms (${lastDetail})`,
-        },
-        pending.submittedAt,
-      );
+      console.error("[audit] polling timed out", {
+        auditId: pending.auditId,
+        elapsedMs,
+        detail: lastDetail,
+      });
+      await this.advanceAgent(state, { cached: pending.cached, success: false });
       return;
     }
 
@@ -255,6 +324,18 @@ export class AuditScheduler extends DurableObject<Env> {
     if (!state.active) return;
     state.alarmLeaseUntil = new Date(Date.now() + ALARM_LEASE_MS).toISOString();
     await this.save(state);
+
+    if (state.pendingBusinessResult !== null) {
+      const pendingAgent = state.batch[state.index];
+      if (!pendingAgent) {
+        state.lastError = "Business result has no matching agent; dropping stale pending state";
+        state.pendingBusinessResult = null;
+        await this.schedule(state, IMMEDIATE_DELAY_MS);
+        return;
+      }
+      await this.finishBusinessResult(state, pendingAgent);
+      return;
+    }
 
     if (state.pendingAudit !== null) {
       const pendingAgent = state.batch[state.index];
@@ -296,33 +377,41 @@ export class AuditScheduler extends DurableObject<Env> {
       batchSize: state.batch.length,
       audited: state.stats.audited,
     });
-    const auditedAt = new Date().toISOString();
+    const attemptedAt = new Date().toISOString();
     const submission = await startAudit(this.env, agent);
     if (!(await this.isCurrentRound(state))) return;
 
-    if (!submission.accepted || !submission.reportId) {
-      await this.finishAgent(
-        state,
-        agent,
-        {
-          reportId: submission.reportId,
-          cached: submission.cached,
-          success: false,
-          error: submission.error ?? "Auditor did not accept the audit",
-        },
-        auditedAt,
-      );
+    if (submission.kind === "failure") {
+      await this.persistSubmissionFailure(state, agent, submission, attemptedAt);
+      return;
+    }
+
+    if (submission.kind === "business_error") {
+      state.pendingBusinessResult = {
+        code: submission.businessError.code,
+        message: submission.businessError.message ?? null,
+        retryable: submission.businessError.retryable ?? null,
+        observedAt: attemptedAt,
+      };
+      state.lastError = null;
+      // Persist the business result before D1 cleanup so a cleanup retry never re-submits.
+      await this.save(state);
+      await this.finishBusinessResult(state, agent);
       return;
     }
 
     state.pendingAudit = {
       auditId: submission.reportId,
       cached: submission.cached,
-      submittedAt: auditedAt,
+      submittedAt: attemptedAt,
       lastStatus: submission.status,
       pollAttempts: 0,
+      failureCleanupPending: true,
     };
     state.lastError = null;
+    // Persist the accepted audit before D1 cleanup so a cleanup retry never re-submits.
+    await this.save(state);
+    if (!(await this.clearAcceptedFailure(state, agent))) return;
     await this.schedule(
       state,
       submission.cached === true ? IMMEDIATE_DELAY_MS : this.pollIntervalMs(),

@@ -4,11 +4,14 @@ Robot that auto-audits agents listed on [8004scan.io](https://8004scan.io).
 
 It pulls agents from the 8004scan public API page by page, and audits them one at a
 time via the auditor service. After an audit is accepted, the robot polls its report
-until the auditor reports `completed` or `failed`; only then does it record the
-result and move to the next agent. Non-cached audits are paced at the configured
-interval; cached audits move on immediately after completion is confirmed. Every
-attempt (success or failure) is recorded to D1. A round makes a single pass over all
-agents and then stops.
+until the auditor reports `completed` or `failed`, then moves to the next agent.
+Structured business errors returned with HTTP 2xx are treated as completed business
+results and are not retried. The auditor currently returns `AGENT_CARD_NOT_FOUND`
+with HTTP 500, so that exact structured error code is treated the same way regardless
+of HTTP status. Non-cached audits are paced at the configured interval;
+cached audits move on immediately after completion is confirmed. D1 only stores
+unresolved transport, HTTP, timeout, or protocol failures from `POST /oasf/audit`.
+A round makes a single pass over all agents and then stops.
 
 ## Architecture
 
@@ -16,22 +19,27 @@ agents and then stops.
 - **Durable Object** `AuditScheduler` (`src/scheduler.ts`) — a single instance that
   drives the whole round using its alarm: fetch a page, audit one agent per alarm,
   advance, and reschedule (immediately if cached, otherwise after the interval).
-- **D1** (`migrations/`, `src/db.ts`) — stores one `audit_records` row per attempt.
+- **D1** (`migrations/`, `src/db.ts`) — stores the current unresolved submission
+  failures in `oasf_audit_fails`, one row per `(chain_id, token_id)`.
 - **Cron** (`*/5 * * * *`) — safety net only. It resumes an active round if its alarm
   was lost; it never starts a new round.
 
 Flow: SCAN API → `AuditScheduler` (alarm loop) → auditor `/oasf/audit` → D1.
 
-`target` is `chain_id:token_id` (e.g. `56:232968`).
+`target` uses the lossless `chain_id:token_id` identity format, for example
+`56:232968`. The auditor keeps `token_id` as a string so uint256-sized IDs are
+not rounded by JavaScript number conversion.
 
-## Audit record fields
+## Submission failure fields
 
-`name`, `chain_id`, `token_id`, `chain_type`, `owner_address`, `audited_at`,
-`report_id` (auditId), `cached`, `success` (0 on network/parse/HTTP errors, i.e. no
-`report_id`), `error`.
+`chain_id`, `token_id`, `chain_type`, `name`, `description`, `owner_address`,
+`target_url`, the latest error kind/status/message/response excerpt/`Retry-After`,
+`attempt_count`, `first_failed_at`, and `last_failed_at`.
 
-The audit `target` is derived on the fly as `chain_id:token_id`, so it isn't stored
-as its own column.
+The table represents unresolved submission failures, not history. Repeated failures
+upsert the same row; a later accepted submission, HTTP 2xx business result, or
+`AGENT_CARD_NOT_FOUND` response deletes the row. Successful audits, report results,
+`auditId`, and `cached` are not stored.
 
 ## Setup
 
@@ -66,20 +74,24 @@ Migrations are applied in order and tracked in D1, so each file runs once.
 
 Configuration lives in `wrangler.jsonc` under `vars`:
 
-| Var | Meaning | Default |
-| --- | --- | --- |
-| `SCAN_BASE_URL` | 8004scan agents endpoint | `https://8004scan.io/api/v1/public/agents` |
-| `SCAN_PAGE_LIMIT` | agents fetched per page | `20` |
-| `AUDITOR_BASE_URL` | auditor service base URL | `https://auditor-agent.infrasika.workers.dev` |
-| `AUDIT_INTERVAL_MS` | delay between non-cached audits | `300000` (5 min) |
-| `AUDIT_POLL_INTERVAL_MS` | delay between report-status polls | `10000` (10 sec) |
-| `AUDIT_POLL_TIMEOUT_MS` | maximum time to wait for a terminal report status | `1860000` (31 min) |
+| Var | Meaning |
+| --- | --- |
+| `SCAN_BASE_URL` | 8004scan agents endpoint |
+| `SCAN_PAGE_LIMIT` | agents fetched per page |
+| `AUDITOR_BASE_URL` | auditor service base URL |
+| `AUDIT_INTERVAL_MS` | delay between non-cached audits and 2xx business results |
+| `AUDIT_POLL_INTERVAL_MS` | delay between report-status polls |
+| `AUDIT_POLL_TIMEOUT_MS` | maximum time to wait for a terminal report status |
+
+Runtime values are environment-specific; use the checked-in `wrangler.jsonc` as the
+source of truth for the current deployment configuration.
 
 ## Run
 
 ```bash
 npm run dev      # local
 npm run deploy   # production
+npm test         # submission classification tests
 ```
 
 ### Endpoints
@@ -89,7 +101,7 @@ npm run deploy   # production
 | `POST /start` | start a fresh round (409 if one is already running) |
 | `POST /stop` | stop the current round |
 | `GET /status` | current round progress + stats |
-| `GET /records?limit=50` | recent audit records from D1 |
+| `GET /audit-failures?limit=50` | current unresolved submission failures from D1 |
 
 Kick off a round:
 
@@ -99,9 +111,9 @@ curl -X POST https://<your-worker>.workers.dev/start
 
 ## Notes
 
-- 8004scan currently lists 660k+ agents; a full non-cached round at 5-min pacing is
+- 8004scan contains a large number of agents; a full non-cached round can be
   effectively unbounded in time. Cached agents are processed back-to-back, so real
   throughput depends heavily on the auditor's cache hit rate. Tune `AUDIT_INTERVAL_MS`
   as needed.
-- Errors are only recorded, never retried (per spec). The cron safety net just resumes
-  a stalled-but-active round.
+- Submission failures are recorded but not automatically retried in a separate retry
+  queue yet. The cron safety net only resumes a stalled active round.

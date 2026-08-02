@@ -3,7 +3,7 @@
 CREATE TABLE IF NOT EXISTS audit_records (
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   name           TEXT,
-  chain_id       INTEGER,                -- target is `chain_id:token_id`
+  chain_id       TEXT,                   -- target is `chain_id:token_id`
   token_id       TEXT,
   chain_type     TEXT,
   owner_address  TEXT,

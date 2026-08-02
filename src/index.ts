@@ -1,5 +1,6 @@
 import type { Env } from "./types";
 import { AuditScheduler } from "./scheduler";
+import { listAuditFails } from "./db";
 
 export { AuditScheduler };
 
@@ -33,15 +34,12 @@ export default {
       return json(await scheduler.status());
     }
 
-    // Recent audit records from D1.
-    if (url.pathname === "/records" && request.method === "GET") {
-      const limit = Math.min(Number(url.searchParams.get("limit")) || 50, 500);
-      const { results } = await env.DB.prepare(
-        `SELECT * FROM audit_records ORDER BY id DESC LIMIT ?`,
-      )
-        .bind(limit)
-        .all();
-      return json({ count: results.length, records: results });
+    // Current unresolved `/oasf/audit` submission failures from D1.
+    if (url.pathname === "/audit-failures" && request.method === "GET") {
+      const requestedLimit = Number(url.searchParams.get("limit")) || 50;
+      const limit = Math.min(Math.max(Math.trunc(requestedLimit), 1), 500);
+      const failures = await listAuditFails(env, limit);
+      return json({ count: failures.length, failures });
     }
 
     if (url.pathname === "/") {
@@ -51,7 +49,7 @@ export default {
           "POST /start": "start a fresh audit round (one pass over all agents)",
           "POST /stop": "stop the current round",
           "GET /status": "current round progress",
-          "GET /records?limit=50": "recent audit records",
+          "GET /audit-failures?limit=50": "unresolved audit submission failures",
         },
       });
     }

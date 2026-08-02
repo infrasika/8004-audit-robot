@@ -12,7 +12,8 @@ export interface Env {
 /** One agent entry from the 8004scan public API. */
 export interface ScanAgent {
   name: string | null;
-  chain_id: number;
+  description: string | null;
+  chain_id: string;
   token_id: string;
   chain_type: string | null;
   owner_address: string | null;
@@ -25,11 +26,18 @@ export interface ScanPage {
 
 /** Response shape from the auditor `/oasf/audit` endpoint. */
 export interface AuditResponse {
-  auditId: string;
-  status: string;
+  auditId?: string;
+  status?: string;
   reportUrl?: string;
   cached?: boolean;
   auditedAt?: string;
+  error?: AuditApiError;
+}
+
+export interface AuditApiError {
+  code: string;
+  message?: string;
+  retryable?: boolean;
 }
 
 /** Response shape from `GET /oasf/report/:auditId`. */
@@ -45,14 +53,35 @@ export interface AuditReportResponse {
   };
 }
 
-/** Result of submitting an audit for asynchronous processing. */
-export interface AuditSubmission {
-  accepted: boolean;
-  reportId: string | null;
-  cached: boolean | null;
-  status: string | null;
-  error: string | null;
+export type AuditSubmitFailureKind = "network" | "timeout" | "http" | "protocol";
+
+export interface AuditSubmitFailure {
+  kind: AuditSubmitFailureKind;
+  httpStatus: number | null;
+  error: string;
+  responseExcerpt: string | null;
+  retryAfter: string | null;
 }
+
+/** Result of submitting an audit for asynchronous processing. */
+export type AuditSubmission =
+  | {
+      kind: "accepted";
+      targetUrl: string;
+      reportId: string;
+      cached: boolean | null;
+      status: string | null;
+    }
+  | {
+      kind: "business_error";
+      targetUrl: string;
+      businessError: AuditApiError;
+    }
+  | {
+      kind: "failure";
+      targetUrl: string;
+      failure: AuditSubmitFailure;
+    };
 
 /** Result of one report-status poll. */
 export interface AuditPollResult {
@@ -62,10 +91,8 @@ export interface AuditPollResult {
   error: string | null;
 }
 
-/** Result of auditing a single agent, ready to persist. */
+/** Runtime result of auditing a single agent; it is not persisted to D1. */
 export interface AuditOutcome {
-  reportId: string | null;
   cached: boolean | null;
   success: boolean;
-  error: string | null;
 }
