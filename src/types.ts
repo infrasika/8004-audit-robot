@@ -2,6 +2,7 @@ export interface Env {
   SCHEDULER: DurableObjectNamespace<import("./scheduler").AuditScheduler>;
   DB: D1Database;
   SCAN_BASE_URL: string;
+  SCAN_API_KEY: string;
   SCAN_PAGE_LIMIT: string;
   AUDITOR_BASE_URL: string;
   AUDIT_INTERVAL_MS: string;

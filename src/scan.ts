@@ -49,7 +49,10 @@ export async function fetchAgentsPage(env: Env, page: number): Promise<ScanPage>
   console.log("[scan] request", { page, limit, url: url.toString() });
   const startedAt = Date.now();
   const resp = await fetch(url.toString(), {
-    headers: { Accept: "application/json" },
+    headers: {
+      Accept: "application/json",
+      "X-API-Key": env.SCAN_API_KEY,
+    },
     signal: AbortSignal.timeout(30_000),
   });
 

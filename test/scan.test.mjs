@@ -10,8 +10,10 @@ afterEach(() => {
 
 test("fetchAgentsPage keeps retry metadata and stringifies chain and token IDs", async () => {
   let requestedUrl;
-  globalThis.fetch = async (url) => {
+  let requestedHeaders;
+  globalThis.fetch = async (url, init) => {
     requestedUrl = new URL(url);
+    requestedHeaders = new Headers(init.headers);
     return Response.json({
       success: true,
       data: [{
@@ -28,11 +30,13 @@ test("fetchAgentsPage keeps retry metadata and stringifies chain and token IDs",
 
   const result = await fetchAgentsPage({
     SCAN_BASE_URL: "https://8004scan.io/api/v1/public/agents",
+    SCAN_API_KEY: "scan-api-key",
     SCAN_PAGE_LIMIT: "100",
   }, 3);
 
   assert.equal(requestedUrl.searchParams.get("page"), "3");
   assert.equal(requestedUrl.searchParams.get("limit"), "100");
+  assert.equal(requestedHeaders.get("X-API-Key"), "scan-api-key");
   assert.equal(result.hasMore, false);
   assert.deepEqual(result.agents[0], {
     name: "Example agent",
@@ -55,6 +59,7 @@ test("fetchAgentsPage preserves uint256-sized chain and token IDs", async () => 
 
   const result = await fetchAgentsPage({
     SCAN_BASE_URL: "https://8004scan.io/api/v1/public/agents",
+    SCAN_API_KEY: "scan-api-key",
     SCAN_PAGE_LIMIT: "100",
   }, 1);
 

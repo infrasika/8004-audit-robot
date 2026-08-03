@@ -77,6 +77,7 @@ Configuration lives in `wrangler.jsonc` under `vars`:
 | Var | Meaning |
 | --- | --- |
 | `SCAN_BASE_URL` | 8004scan agents endpoint |
+| `SCAN_API_KEY` | API key sent to 8004scan as the `X-API-Key` header |
 | `SCAN_PAGE_LIMIT` | agents fetched per page |
 | `AUDITOR_BASE_URL` | auditor service base URL |
 | `AUDIT_INTERVAL_MS` | delay between non-cached audits and 2xx business results |
