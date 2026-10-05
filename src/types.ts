@@ -23,6 +23,7 @@ export interface ScanAgent {
 export interface ScanPage {
   agents: ScanAgent[];
   hasMore: boolean;
+  nextCursor: string | null;
 }
 
 /** Response shape from the auditor `/oasf/audit` endpoint. */

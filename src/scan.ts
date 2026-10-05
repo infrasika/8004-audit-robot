@@ -7,10 +7,10 @@ function normalizeUint256Decimal(value: unknown): string {
   const decimal = typeof value === "string"
     ? value.trim()
     : typeof value === "number" && Number.isSafeInteger(value)
-      ? String(value)
-      : typeof value === "bigint"
-        ? value.toString()
-        : "";
+    ? String(value)
+    : typeof value === "bigint"
+      ? value.toString()
+      : "";
   if (!/^\d+$/.test(decimal) || BigInt(decimal) > UINT256_MAX) {
     throw new Error("identifier must be an unsigned uint256 decimal integer");
   }
@@ -27,26 +27,56 @@ interface ScanApiResponse {
     chain_type: string | null;
     owner_address: string | null;
   }>;
+  error?: {
+    code?: string;
+    message?: string;
+  };
   meta?: {
     pagination?: {
       page: number;
       limit: number;
       total: number;
       hasMore: boolean;
+      nextCursor?: string | null;
     };
   };
 }
 
-/** Fetch a single page of agents from the 8004scan public API. */
-export async function fetchAgentsPage(env: Env, page: number): Promise<ScanPage> {
+export class ScanRequestError extends Error {
+  readonly status: number;
+  readonly retryable: boolean;
+
+  constructor(status: number, message: string, retryable = isRetryableScanStatus(status)) {
+    super(message);
+    this.name = "ScanRequestError";
+    this.status = status;
+    this.retryable = retryable;
+  }
+}
+
+export function isRetryableScanStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function scanErrorMessage(status: number, body: ScanApiResponse | null): string {
+  const detail = body?.error?.message ?? body?.error?.code;
+  const suffix = detail ? `: ${detail}` : "";
+  return `SCAN request failed (${status})${suffix}`;
+}
+
+/** Fetch a page of agents from the 8004scan public API using cursor pagination. */
+export async function fetchAgentsPage(
+  env: Env,
+  cursor: string | null = null,
+): Promise<ScanPage> {
   const limit = Number(env.SCAN_PAGE_LIMIT) || 20;
   const url = new URL(env.SCAN_BASE_URL);
-  url.searchParams.set("page", String(page));
   url.searchParams.set("limit", String(limit));
   url.searchParams.set("sortBy", "created_at");
   url.searchParams.set("sortOrder", "desc");
+  if (cursor) url.searchParams.set("cursor", cursor);
 
-  console.log("[scan] request", { page, limit, url: url.toString() });
+  console.log("[scan] request", { cursor: cursor !== null, limit });
   const startedAt = Date.now();
   const resp = await fetch(url.toString(), {
     headers: {
@@ -56,13 +86,23 @@ export async function fetchAgentsPage(env: Env, page: number): Promise<ScanPage>
     signal: AbortSignal.timeout(30_000),
   });
 
-  if (!resp.ok) {
-    console.error("[scan] request failed", { page, status: resp.status, ms: Date.now() - startedAt });
-    throw new Error(`SCAN request failed (${resp.status}) for page ${page}`);
+  let body: ScanApiResponse | null = null;
+  try {
+    body = (await resp.json()) as ScanApiResponse;
+  } catch {
+    body = null;
   }
 
-  const body = (await resp.json()) as ScanApiResponse;
-  const agents: ScanAgent[] = (body.data ?? []).map((a) => ({
+  if (!resp.ok) {
+    console.error("[scan] request failed", {
+      status: resp.status,
+      ms: Date.now() - startedAt,
+      detail: body?.error,
+    });
+    throw new ScanRequestError(resp.status, scanErrorMessage(resp.status, body));
+  }
+
+  const agents: ScanAgent[] = (body?.data ?? []).map((a) => ({
     name: a.name ?? null,
     description: a.description ?? null,
     chain_id: normalizeUint256Decimal(a.chain_id),
@@ -71,13 +111,13 @@ export async function fetchAgentsPage(env: Env, page: number): Promise<ScanPage>
     owner_address: a.owner_address ?? null,
   }));
 
-  const hasMore = body.meta?.pagination?.hasMore ?? agents.length === limit;
+  const nextCursor = body?.meta?.pagination?.nextCursor || null;
+  const hasMore = nextCursor !== null && (body?.meta?.pagination?.hasMore ?? true);
   console.log("[scan] response", {
-    page,
     count: agents.length,
     hasMore,
-    total: body.meta?.pagination?.total,
+    total: body?.meta?.pagination?.total,
     ms: Date.now() - startedAt,
   });
-  return { agents, hasMore };
+  return { agents, hasMore, nextCursor };
 }

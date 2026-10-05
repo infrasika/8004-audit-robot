@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { AuditOutcome, AuditSubmission, Env, ScanAgent } from "./types";
-import { fetchAgentsPage } from "./scan";
+import { fetchAgentsPage, ScanRequestError } from "./scan";
 import { pollAudit, startAudit } from "./auditor";
 import { deleteAuditFail, upsertAuditFail } from "./db";
 
@@ -10,6 +10,9 @@ const IMMEDIATE_DELAY_MS = 1_000;
 const DEFAULT_POLL_INTERVAL_MS = 10_000;
 const DEFAULT_POLL_TIMEOUT_MS = 1_860_000;
 const ALARM_LEASE_MS = 120_000;
+const SCAN_RETRY_DELAY_MS = 30_000;
+const LEGACY_OFFSET_STOP_MESSAGE =
+  "SCAN offset pagination can no longer continue; start a new round to use cursor pagination";
 
 interface RoundStats {
   audited: number;
@@ -23,10 +26,12 @@ interface RoundStats {
 interface RoundState {
   active: boolean;
   roundId: string | null;
-  page: number; // last fetched page (0 = none yet)
+  page: number; // pages fetched this round (0 = none yet)
   batch: ScanAgent[]; // current batch of agents
   index: number; // next index within batch to audit
-  hasMore: boolean; // whether SCAN reports more pages after `page`
+  hasMore: boolean; // whether SCAN reports more pages after the current cursor
+  /** Cursor for the next SCAN page. Missing on pre-cursor rounds. */
+  nextCursor?: string | null;
   stats: RoundStats;
   startedAt: string | null;
   finishedAt: string | null;
@@ -62,6 +67,7 @@ function freshState(): RoundState {
     batch: [],
     index: 0,
     hasMore: true,
+    nextCursor: null,
     stats: { audited: 0, succeeded: 0, failed: 0, skipped: 0, cached: 0, pages: 0 },
     startedAt: null,
     finishedAt: null,
@@ -96,6 +102,7 @@ export class AuditScheduler extends DurableObject<Env> {
       pendingAudit,
       pendingBusinessResult: stored.pendingBusinessResult ?? null,
       alarmLeaseUntil: stored.alarmLeaseUntil ?? null,
+      nextCursor: Object.hasOwn(stored, "nextCursor") ? stored.nextCursor ?? null : undefined,
     };
   }
 
@@ -355,19 +362,43 @@ export class AuditScheduler extends DurableObject<Env> {
         await this.finalize(state);
         return;
       }
-      const next = await fetchAgentsPage(this.env, state.page + 1);
-      if (!(await this.isCurrentRound(state))) return;
-      state.page += 1;
-      state.batch = next.agents;
-      state.hasMore = next.hasMore;
-      state.index = 0;
-      state.stats.pages += 1;
-      state.lastError = null;
-      if (state.batch.length === 0) {
+      if (state.page > 0 && state.nextCursor === undefined) {
+        state.lastError = LEGACY_OFFSET_STOP_MESSAGE;
+        console.error("[scan] stopping legacy offset round");
         await this.finalize(state);
         return;
       }
-      await this.save(state);
+      try {
+        const next = await fetchAgentsPage(this.env, state.nextCursor ?? null);
+        if (!(await this.isCurrentRound(state))) return;
+        state.page += 1;
+        state.batch = next.agents;
+        state.hasMore = next.hasMore;
+        state.nextCursor = next.nextCursor;
+        state.index = 0;
+        state.stats.pages += 1;
+        state.lastError = null;
+        if (state.batch.length === 0) {
+          await this.finalize(state);
+          return;
+        }
+        await this.save(state);
+      } catch (err) {
+        if (!(await this.isCurrentRound(state))) return;
+        const message = err instanceof Error ? err.message : String(err);
+        state.lastError = message;
+        const retryable = err instanceof ScanRequestError
+          ? err.retryable
+          : true;
+        if (!retryable) {
+          console.error("[scan] fatal list error; ending round", { message });
+          await this.finalize(state);
+          return;
+        }
+        console.warn("[scan] retrying list fetch", { message });
+        await this.schedule(state, SCAN_RETRY_DELAY_MS);
+        return;
+      }
     }
 
     const agent = state.batch[state.index];
